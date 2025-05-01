@@ -1,0 +1,80 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  creationTimestamp: null
+  labels:
+    run: planet
+  name: planet
+  namespace: test
+spec:
+  containers:
+  - image: ankur6ue/kops_target_group_blog_post_image_planet:latest
+    name: planet-image
+    ports:
+      - containerPort: 5000
+    resources:
+      requests:
+        memory: "128Mi"
+        cpu: "250m"
+      limits:
+        memory: "128Mi"
+        cpu: "500m"
+  dnsPolicy: ClusterFirst
+status: {}
+
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  creationTimestamp: null
+  labels:
+    run: dashboard
+  name: dashboard
+  namespace: test
+spec:
+  containers:
+  - image: ankur6ue/kops_target_group_blog_post_image_dashboard:latest
+    name: dashboard-image
+    ports:
+      - containerPort: 6000
+    resources:
+      requests:
+        memory: "128Mi"
+        cpu: "250m"
+      limits:
+        memory: "128Mi"
+        cpu: "500m"
+  dnsPolicy: ClusterFirst
+status: {}
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    run: planet-svc
+  name: planet-svc
+  namespace: test
+spec:
+  selector:
+    run: planet
+  ports:
+    - protocol: TCP
+      port: 5001
+      targetPort: 5000
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    run: dashboard-svc
+  name: dashboard-svc
+  namespace: test
+spec:
+  selector:
+    run: dashboard
+  ports:
+    - protocol: TCP
+      port: 6001
+      targetPort: 6000

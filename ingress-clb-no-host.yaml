@@ -1,0 +1,40 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ingress-clb-dashboard
+  namespace: test
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /$2
+spec:
+  rules:
+  - http:
+      paths:
+      - path: /dashboard_app(/|$)(.*)
+        pathType: ImplementationSpecific
+        backend:
+          service:
+            name: dashboard-svc
+            port:
+              number: 6001
+  ingressClassName: nginx
+---
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ingress-clb-planet
+  namespace: test
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /$2
+spec:
+  rules:
+  - http:
+      paths:
+      - path: /planet_app(/|$)(.*)
+        pathType: ImplementationSpecific
+        backend:
+          service:
+            name: planet-svc
+            port:
+              number: 5001
+  ingressClassName: nginx
