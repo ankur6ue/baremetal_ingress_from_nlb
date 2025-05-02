@@ -1,27 +1,31 @@
-In this post, I'll show you how to expose two applications running in a Kops provisioned kubernetes cluster using several techniques, increasing in complexity. 
+This post shows how to expose two applications running in a [Kops](https://kops.sigs.k8s.io/) provisioned kubernetes cluster using several techniques, increasing in complexity. This is relevant because exposing applications running in a cluster to external users is obviously essential for those applications to be usable. The techniques we'll explore are:
 - Exposing the applications internally within the cluster using Kubernetes services [easy and well-known]
 - Exposing the applications externally using Nodeport services [easy and well-known]
-- Setting up traffic-routing using nginx-ingress controller [somewhat tricky]
-- Exposing a bare-metal nginx-ingress controller through the load balancer created by Kops [never done before, AFAIK :-)]
+- Exposing the applications externally using nginx-ingress Cloud Loadbalancer and setting up traffic-routing [somewhat tricky]
+- Exposing the applications externally using bare-metal nginx-ingress controller through the load balancer created by Kops [never done before, AFAIK :-)]
 
 ## Abbreviations
 Henceforth, I'll be using the following abbreviations:
-LB: LoadBalancer
-NLB: Network LoadBalancer
-CLB: Classic LB
-ALB: Application LB
-SG: Security Group
-Svc: Kubernetes Service
-NP: NodePort service
-CRD: Custom Resource Definition
-k: Kubectl
-k8s: Kubernetes
+- LB: LoadBalancer
+- NLB: Network LoadBalancer
+- CLB: Classic LB
+- ALB: Application LB
+- SG: Security Group
+- Svc: Kubernetes Service
+- NP: NodePort service
+- CRD: Custom Resource Definition
+- k: Kubectl
+- k8s: Kubernetes
+- inc: nginx-ingress-controller
 
 ## Prerequisities 
-This post covers a lot of technologies and assumes a solid understanding of:
+This post covers a lot of technologies and not meant to be a tutorial on those technologies. It assumes a solid understanding of:
 - Kubernetes architecture and concepts such as pods, services, deployments, namespaces etc.
+- Familiarity with using kubectl commands 
 - AWS concepts such as EC2 instances, security groups, load balancing
 - Setting up and operating a kubernetes cluster using Kops
+
+I also won't delve into authentication/authorization and secure comms techniques such as SSL. 
 
 While this material has been designed and tested on a Kops provisioned cluster, the concepts should apply to an EKS cluster as well. 
 
@@ -30,40 +34,48 @@ I created my kubernetes cluster on AWS using the following command:
 ```angular2html
 kops create cluster --zones=us-east-1a --cloud=aws --name=${NAME} --state=${KOPS_STATE_STORE} --discovery-store=s3://ankur-kops-k8s-oidc-store/${NAME}/discovery --node-size t2.medium --master-size t2.medium --node-count 1 --dns=None
 ```
-For more info, see Kops [documentation](https://kops.sigs.k8s.io/getting_started/aws/). Kops provisions the EC2 instances, security groups, inbound/outbound rules etc that are required for the instances on your cluster to talk to each other. The details of how kubernetes networking works is a topic of another post. Here I'll focus on how external traffic gets to your cluster LB and how is it routed to internal k8s services. We'll use these concepts repeatedly throughout the post
+For more info, see Kops [documentation](https://kops.sigs.k8s.io/getting_started/aws/). Kops provisions the EC2 instances, security groups, inbound/outbound rules etc., that are required for the instances on your cluster to talk to each other. I won't go through the details of how kubernetes networking works.. Here I'll focus on how external traffic enters your cluster LB and how is it routed to internal k8s services. We'll use these concepts repeatedly throughout the post
 
-In AWS EC2 console, click on the NLB created by Kops. 
+In AWS EC2 console, click on the NLB created by Kops. If you are not familiar with NLBs, target groups, listeners etc., please go through the relevant AWS docs.
+
 Under listeners, you'll see two listeners:
 
 ![img_1.png](images/img_01.png)
 ![img_2.png](images/img_02.png)
 
-Port 443 is used by kubectl to interact with your k8s cluster. On an ubuntu system, the configuration file used by kubectl is located in ~/.kube. If you look in this file, you'll see the name of the cluster and user under your current kubectl context. The certificates used for SSL comms are located here also. 
+Port 443 is used by kubectl to interact with your k8s cluster. On an ubuntu system, the configuration file used by kubectl is located in ~/.kube. If you look in this file, you'll see the name of the cluster and user under your current kubectl context. The certificates used for SSL comms are also located here. 
 
 Port 3988 is used internally by kubernetes and not relevant to us. 
 
 If you click on target group associated with port 443, you'll see that it points to port 443 on an EC2 instance in your control plane.
 
-![img_7.png](images/img_07.png)
+![img_001.png](images/img_001.png)
 
-As shown in the picture above, to accept traffic on ports 443, the LB must open those ports for inbound traffic in its attached security group. If you check the inbound rules of the SG attached to the NLB, you'll see the corresponding rule
+So that's how HTTPS requests corresponding to your kubectl commands enters your cluster.
+
+Next, let's look at the inbound rules on the SGs attached to the NLB and control plane instances. To accept traffic on ports 443, the NLB must open that port for inbound traffic in its security group. 
+
+![img_07.png](images/img_07.png)
+
+If you check the inbound rules of the SG attached to the NLB, you'll see the corresponding rule
 
 ![img_4.png](images/img_04.png)
 
-Similarly, the security group attached to the EC2 instance targeted by the target group must also allow traffic on port 443 from the LB's security group. You should verify this is the case. We'll use this concept several times in this post.
+So this allows inbound HTTPS traffic from anywhere (0.0.0.0/0) on port 443. Similarly, the security group attached to the EC2 instance targeted by the target group must also allow traffic on port 443 from the LB's security group. You should verify this is the case. We'll use this concept several times in this post.
 
-Note that Kops creates a Network LB. There are also Classic LB and Application LB. See AWS docs for the difference between the three. Later in the post, we'll use a CLB as well. 
+Note that Kops creates a Network LB. There are also other types of LBs, namely Classic LB and Application LB. See AWS docs for the difference between the three. Later in the post, we'll use a CLB as well. 
 
 ## Test applications
 
-We'll use two dummy applications `planet` and `dashboard`. These applications are simple flash servers that serve simple messages (with a random number appended, so refreshing results in a different message) on several paths on ports 5000 and 6000. See code in planet_app and dashboard_app directories for details. Dockerfiles used to build the corresponding docker images and run the servers are also in the application directories. I've already built and pushed the corresponding images to my dockerhub account. 
+We'll use two dummy applications `planet` and `dashboard`. These applications are simple flash servers that serve simple messages (with a random number appended, so refreshing the browser results in a different message) on several paths on ports 5000 and 6000. See code in planet_app and dashboard_app directories for details. Dockerfiles used to build the corresponding docker images and run the servers are also in the application directories. I've already built and pushed the corresponding images to my dockerhub account. The application deployments we'll be using refer to those images. 
 
 ## Application access internally using k8s services
-Create a namespace named test using `kubectl create ns test`. Then deploy a kubernetes deployment by running `k apply -f flask_server_deployment.yaml`. This should create 1 pod and 1 clusterIP svc in the test namespace. Check that the pod and services are running. 
+Create a namespace named `test` using `kubectl create ns test`. Then deploy a kubernetes deployment by running `k apply -f flask_server_deployment.yaml`. This should create 1 pod and 1 clusterIP svc in the test namespace. Check that the pod and services are running. 
 
 Run a curl pod in an interactive session as below
 
 `kubectl run curl --image=radial/busyboxplus:curl -i --tty --rm`
+
 Then curl one of the pods and verify you are able to access the server exposed by that pod
 
 ![img.png](img.png)
@@ -80,12 +92,16 @@ Kubernetes services provide a layer of abstraction over your application pods. I
 
 You can check the matching endpoints created by k8s using `kubectl get endpoints -n test` The IP addresses should match the IPs of your application pods.
 
-As clusterIP services can only be accessed internally within the k8s cluster, our applications are not accessible outside the cluster
+As clusterIP services can only be accessed internally within the k8s cluster, our applications are not accessible outside the cluster. Let's see how can we expose our applications outside the cluster.
+
 ## Application access outside the cluster using Nodeport services 
 
 To access the applications outside the cluster, we can use Nodeport service. This service type exposes a nodeport on every instance of the cluster. The application can then be accessed using instance_public_ip:nodeport. On AWS, the instance must also have a security group with inbound rule that allow traffic on that port (or a range of ports that includes that port)
 
 To deploy a Nodeport service that selects our applications, run `kubectl apply -f flask_nodeport_svc.yaml`. This will set up two nodeport services in the test namespace that expose planet app on port 31000 and dashboard app on port 32000. To expose these ports to the internet, we must modify the security group attached to one of our cluster instances to allow for traffic on those ports. This is shown in the screenshots below.
+
+Control plane SGs
+
 ![img_3.png](images/img_3.png)
 
 Add inbound rule
@@ -94,7 +110,7 @@ Add inbound rule
 
 ![img_5.png](images/img_5.png)
 
-Creating a nodeport service opens up the nodeport on every instance of your cluster, so you only need to modify the security group for either the control plane or the worker group instances. Then you can access the nodeport service using the public ip of the instance. For example, in the diagram below the planet and dashboard nodeport is exposed on the control plane and the worker instances, but external traffic enters via control plane instance that has the right inbound rule attached to its security group.
+Creating a nodeport service opens up the Nodeport on every instance of your cluster, so you only need to modify the security group for either the control plane or the worker group instances. Then you can access the NP service using the public ip of the instance. For example, in the diagram below, the planet and dashboard NP is exposed on the control plane and the worker instances, but external traffic enters via control plane instance that has the right inbound rule attached to its security group. The NP service will distribute traffic to application pods running on various instances in your cluster
 
 ![img_5.png](images/img_05.png)
 
@@ -122,7 +138,7 @@ You can install a cloud nginx-ingress as below.
 
 You should see the nginx-ingress controller pod running. This controller checks for updates to ingress CRDs that describe routing rules and installs the routing rules. Now check for services in the ingress-nginx namespace
 
-You'll see ingress-nginx-controller and ingress-nginx-controller-admission services. Out of these, ingress-nginx-controller is more relevant to our discussion here. This svc is of type LoadBalancer, meaning that it does two things:
+You'll see `ingress-nginx-controller` and `ingress-nginx-controller-admission services`. Out of these, `ingress-nginx-controller` is more relevant to our discussion here. This svc is of type LoadBalancer, meaning that it does two things:
 - exposes ports 80 and 443 (for HTTP and HTTPS traffic respectively) on NodePorts
 - Creates a Classic LoadBalancer (on AWS) that directs traffic to these ports
 
@@ -130,9 +146,9 @@ It is instructive to see the properties of this classic load balancer. Go to the
 
 ![img_6.png](images/img_6.png)
 
-Now click on Target Instances. You should see the instance id of your control plane or worker instance group. To allow traffic from the newly created CLB, an inbound rule is added to the SG attached to this instance group that allows all traffic from the CLB. Similarly, inbound rules on the CLB SG allow HTTP and HTTPS traffic from anywhere. So that's how external traffic enters the CLB and is directed to our cluster through the nodeports created by nginx-ingress. 
+Now click on target Instances. You should see the instance id of your control plane or worker instance group. To allow traffic from the newly created CLB, an inbound rule is added to the SG attached to this instance group that allows all traffic from the CLB. Similarly, inbound rules on the CLB SG allow HTTP and HTTPS traffic from anywhere. So that's how external traffic enters the CLB and is directed to our cluster through the nodeports created by nginx-ingress. 
 
-Now if you copy and paste the classic load balancer's URL in a browser, you should see the nginx '404 not found' page. That shows us that all the routing and security groups are set up correctly and we are able to hit the ingress controller. 
+Now if you copy and paste the classic load balancer's URL in a browser, you should see the nginx '404 not found' page. This is actually good, because it shows us that all the routing and security groups are set up correctly and we are able to hit the ingress controller and see the default HTML page. 
 
 ### Configuring CLB Health Check
 Go back to the classic load balancer created by nginx-ingress and select the Health Checks tab. You'll see something like this:
@@ -146,7 +162,7 @@ Let's try curling it..Get the IP address of the nginx-controller pod using `k ge
 
 ![img_10.png](images/img_10.png)
 
-Notice that in pod yaml, port 10254 is not listed under ports of the nginx-ingress-controller deployment. Liveness/readiness ports don't need to be explicitly exposed because k8s automatically does that for us. 
+Notice that in the yaml for nginx-ingress-controller deployment, port 10254 is not listed under ports. This is because Liveness/Readiness ports don't need to be explicitly exposed because k8s automatically does that for us. 
 
 So that's great. But where is the 31746 coming from? This took me sometime to figure out.. run a `k describe svc -n ingress-nginx ingress-nginx-controller`
 
@@ -181,9 +197,9 @@ Developers still access the cluster using the Kops created NLB. Users of our das
 
 The documentation for nginx-ingress is pretty bad. They should describe these gotchas clearly through examples.. that's the pitfall of using open-source SW! It can be feature rich, but hard to use.. 
 
-## Application access outside the cluster using nginx-ingress CLB
+## Application access outside the cluster using baremetal ingress 
 
-The setup described so far should work for most people and keeps the LB through which applications running on the cluster are accessed separate from the LB used to manage the cluster. However, LBs cost money.. eg., a depending on usage, a CLB could cost ~20$ a month! I was wondering, can't we use the NLB already created by Kops to access my applications via ingress? The answer is yes, and this section will teach you how.
+The setup described in the previous section should work for most people and keeps the LB through which applications running on the cluster are accessed separate from the LB used to manage the cluster. However, LBs cost money.. eg., depending on usage, a CLB could cost ~20$ a month! I was wondering, can't we use the NLB already created by Kops to access my applications via ingress? The answer is yes, and this section will teach you how.
 
 First destroy the cloud ingress. You should delete the ingress objects first, followed by the resources created by ingress controller
 ```angular2html
@@ -192,7 +208,7 @@ k delete -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controlle
 ```
 Verify that all resources in the ingress-nginx namespace and the namespace itself is deleted, and the AWS resources created by the ingress controller are deleted as well.
 
-Now, we need to install a different kind of ingress, called a [baremetal ingress](https://github.com/kubernetes/ingress-nginx/blob/main/docs/deploy/baremetal.md). This ingress type doesn't create a LB and relies on the user to direct traffic to the ingress controller. 
+Now, we need to install a different kind of ingress, called a [baremetal ingress](https://github.com/kubernetes/ingress-nginx/blob/main/docs/deploy/baremetal.md). This ingress type doesn't create a LB and relies on the user to set up their LB to direct traffic to the ingress controller. 
 
 Let's install the baremetal ingress:
 ```angular2html
@@ -235,7 +251,7 @@ Configuring health check
 
 ![img_17.png](images/img_17.png)
 
-On the register targets screen, select the EC2 instance in your kubernetes control plane, and pick the NodePort corresponding to port 80 in your ingress-nginx-controller service configuration, as shown below.
+On the register targets screen, select the EC2 instance in your kubernetes control plane, and pick the Nodeport corresponding to port 80 in your ingress-nginx-controller service configuration, as shown below.
 
 ![img_18.png](images/img_18.png)
 
@@ -259,5 +275,5 @@ If we want to create a "real" health check, we can create a separate Nodeport se
 
 Now you can attach this target group to the Kops NLB, and everything should work as before. 
 
-Note: Since we have modified Kops created AWS resources, we must clean up all of our changes before `kops delete cluster` command will succeed. 
+Note: Since we have modified Kops created AWS resources, we must clean up all of our changes before `kops delete cluster` command will succeed. In a subsequent post, I'll describe how we can use AWS CLI commands to create the set up above. Hope you found this useful!
 
